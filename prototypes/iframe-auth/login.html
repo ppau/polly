@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8">
+		<title></title>
+	</head>
+	<body>
+		<form id="form" action="/login" method="POST">
+			<input name="username" type='text' placeholder='Username'><br>
+			<input name="password" type="password" placeholder="Password"><br>
+			<input type="submit" value="Submit">
+		</form>
+	</body>
+	<script>
+		form = document.getElementById("form");
+		form.action = "/login" + location.search;
+	</script>
+</html>
