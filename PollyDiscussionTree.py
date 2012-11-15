@@ -6,6 +6,8 @@ from datetime import datetime
 import sys
 import uuid
 
+from PollyException import PollyException
+
 #
 #   A Sortable Discussion Tree stored in MongoDB
 #    
@@ -92,19 +94,6 @@ import uuid
 #
 #
 
-class PollyException(Exception):
-    def __init__(self, message, e=None):
-        Exception.__init__(self, "PollyException(" + sys._getframe(1).f_code.co_name + "): "+message)
-        self.e = e
-    
-    def dumpStr(self, depth=0):
-        if self.e:
-            if isinstance(self.e, PollyException):
-                return " "*(depth*8) + self.message + "\n" + self.e.dumpStr(depth+1)
-            else:
-                return " "*(depth*8) + self.message + "\n" + " "*(depth*8+8) + str(self.e)
-        else:
-            return " "*(depth*8) + self.message   
 
 class PollyDiscussionTree:
     def __init__(self, db):
@@ -216,7 +205,7 @@ class PollyDiscussionTree:
                                      update={"$push": {"comments": comment}},
                                      upsert=True, new=True)
         except Exception, e:
-            callback(None, PollyException("find_and_modify failed on PollyDiscussionTree(%s)/$push(%s)" % (str(comment),), e))
+            callback(None, PollyException("find_and_modify failed adding comment(%s) to root of PollyDiscussionTree" % (str(comment),), e))
             return
         callback(('0.'+str(len(subtree["comments"])-1), comment), None)  # Success
         
@@ -319,7 +308,7 @@ if __name__ == "__main__":
             # Add deeper comments as would be added by users.
             try:
                 pseudo = "AndrewD"
-                for depth in xrange(5):
+                for depth in xrange(4):
                     new_comments = {}
                     for parent_subtree_id, comment in comments.iteritems():
                         for n in xrange(3):
@@ -379,9 +368,9 @@ if __name__ == "__main__":
             yield motor.Op(testPolly.pdt.setupIndexes)
             yield motor.Op(testPolly.setupReputations)           # Setup some reputations to apply to the discussion tree.
             yield motor.Op(testPolly.createPollyDiscussionTree)  # Create a discussion tree.
-            yield motor.Op(testPolly.dumpTree, "0", 0)            # Do a recursive dump of the discussion tree, with reputations.
+            yield motor.Op(testPolly.dumpTree, "0", 0)           # Do a recursive dump of the discussion tree, with reputations.
         except PollyException, e:
-            print(e.dumpStr())
+            e.pollyStackDump()
             sys.exit(1)
         print "Done."
         sys.exit(0)
