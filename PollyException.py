@@ -56,7 +56,6 @@ class PollyException(Exception):
             frame = sys._getframe(1)
             self.exception_description =  "PollyException: " + message
             self.exception_location    = 'File "'+frame.f_code.co_filename + '", line ' + str(frame.f_lineno) + ', method ' + frame.f_code.co_name
-            self.exception_line        = None
         else:
             etype, value, tb = sys.exc_info()
             self.exception_description =  etype.__name__+': '+str(value)
