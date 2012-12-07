@@ -4,6 +4,9 @@ from bson.code import Code
 import motor
 from datetime import datetime
 import sys
+import uuid
+
+from PollyException import PollyException
 
 #
 #   A Sortable Discussion Tree stored in MongoDB
@@ -57,7 +60,7 @@ import sys
 #    5. Cache large pre-sorted sub-columns at server
 #    6. Deliver readable (fits to screen) chunks at a time to client by push
 #    7. sub-column storage on disk is always in time-order inside document (working to the MongoDB strength of in-place updates.)
-#    8. May pre-fetch first chunks of sub-columns below currently opened sub-column in client as optimisation.
+#    8. May pre-fetch first chunks of sub-columns below currently opened sub-column in client as optimization.
 #
 #
 #    MongoDB PollyReputation document format: 
@@ -70,35 +73,27 @@ import sys
 #
 #    MongoDB PollyDiscussionTree document format: 
 #    {
+#        "_id"       : <uuid4>                  # Randomly generated uuid. When users add comments, the client request
+#                                               # must specify this uuid of the comment they are replying to. This protects
+#                                               # the tree against all sorts of hacks/bugs.  
 #        "subtree_id": <DottedDecimalSubreeId>, # Dotted tree hierarchy sub-tree reference as string. e.g. "3.3.1"
-#        "comments":    [                       # Array position indicates next sub-tree level. e.g. 0th entry is 3.3.1.0
+#        "comments"  : [                        # Array position indicates next sub-tree level. e.g. 0th entry is 3.3.1.0
 #            {
-#                "time":      <Comment Time>    # Time the comment was written in UTC
-#                "pseudo":    <UserPseudonym>   # Pseudonym of the user that wrote the comment.
-#                "repute":    <reputation>      # The reputation of <UserPseudonym> at the time of the comment
+#                "child_id":  <uuid4>           # child_id is _id of child PollyDiscussionTree document.
+#                "time"    :  <Comment Time>    # Time the comment was written in UTC
+#                "pseudo"  :  <UserPseudonym>   # Pseudonym of the user that wrote the comment.
+#                "repute"  :  <reputation>      # The reputation of <UserPseudonym> at the time of the comment
 #                                               # Incidentally, a more expensive option would be to allow sorting
 #                                               # the comments by current reputation. Probably cached in memory.
-#                "text":      <StringComment>   # The actual comment. 
-#                                               # Allowing some simple (TBD) markup. Probably Markdown.
+#                "text"    :  <StringComment>   # The actual comment. 
+#                                               # Allowing some simple (TBD) markup. Probably 'Markdown'.
 #            },
 #            ...
 #        ],
 #    }
 #
 #
-class PollyException(Exception):
-    def __init__(self, message, e=None):
-        Exception.__init__(self, "PollyException(" + sys._getframe(1).f_code.co_name + "): "+message)
-        self.e = e
-    
-    def dumpStr(self, depth=0):
-        if self.e:
-            if isinstance(self.e, PollyException):
-                return " "*(depth*8) + self.message + "\n" + self.e.dumpStr(depth+1)
-            else:
-                return " "*(depth*8) + self.message + "\n" + " "*(depth*8+8) + str(self.e)
-        else:
-            return " "*(depth*8) + self.message   
+
 
 class PollyDiscussionTree:
     def __init__(self, db):
@@ -190,48 +185,91 @@ class PollyDiscussionTree:
             return
         callback(subtree, None)
 
+
     @tornado.gen.engine
-    def addCommentTosubtree(self, subtree_id, pseudo, text, callback):
-        '''addCommentTosubtree: If subtree matching subtree_id does not exist, then it will be added.
+    def addRootComment(self, text, callback):
+        '''addRootComment: Only way to add comments at the 0.x level. This method will not be generally exposed 
+                           to the web interface. Users can not add comments at this level. It's a bootstrapping thing.
+                                
+                text        - Text of the comment to be added.
+                callback    - Standard motor callback
+
+                returns: Success: Comment dictionary.
+                         Failure: PollyException
+        '''
+        # Try for atomic upsert(1st comment) or update(Nth comment)
+        comment = {"child_id": uuid.uuid4(), "pseudo":'root', "text":text, "repute":0, "time":datetime.utcnow() }
+        try:
+            subtree = yield motor.Op(self.pollyDiscussionTree.find_and_modify, 
+                                     query={"subtree_id": '0'},
+                                     update={"$push": {"comments": comment}},
+                                     upsert=True, new=True)
+        except Exception, e:
+            callback(None, PollyException("find_and_modify failed adding comment(%s) to root of PollyDiscussionTree" % (str(comment),), e))
+            return
+        callback(('0.'+str(len(subtree["comments"])-1), comment), None)  # Success
+        
+
+    @tornado.gen.engine
+    def addCommentToSubtree(self, parent_uuid, parent_subtree_id, text, pseudo, callback):
+        '''addCommentToSubtree: If subtree matching subtree_id does not exist, then it will be added.
                                 The comment text will be added to the the subtree.
                                 Reputation of the user adding the comment will be applied.
                                 
-                subtree_id - Identifier of the subtree where the comment will be added.
-                pseudo     - The Pseudonym of the user adding the comment.
-                text       - Text of the comment to be added.
-                callback   - Standard motor callback
+                parent_uuid        - uuid of the parent comment. Must match in the same record with the parent_subtree_id.
+                parent_subtree_id  - Dotted notation identifier of the subtree where the comment will be added.
+                text               - Text of the comment to be added.
+                pseudo             - The Pseudonym of the user adding the comment.
+                callback           - Standard motor callback
 
                 returns: Success: Comment dictionary with repute and time-stamp.
                          Failure: PollyException
         '''
         try:   # to get the pseudo's current reputation and assess whether the subtree already exists, in parallel.
-            subtree, reputation = yield [
-                motor.Op(self.pollyDiscussionTree.find_one, {"subtree_id": subtree_id}),
-                motor.Op(self.getReputation, pseudo, subtree_id) 
-            ]
+            reputation = yield motor.Op(self.getReputation, pseudo, parent_subtree_id)
         except Exception, e:
-            callback(None, PollyException("Couldn't find PollyDiscussionTree(%s) or Reputation(%s,%s)" % (subtree_id, pseudo, subtree_id), e))
+            callback(None, PollyException("Couldn't find Reputation(%s,%s)" % (pseudo, parent_subtree_id), e))
             return
         
-        comment = {"pseudo":pseudo, "text":text, "repute":reputation, "time":datetime.utcnow() }
-        if subtree is None: # New subtree
-            try:
-                pdt = {"subtree_id": subtree_id, "comments": [comment]}
-                result = yield motor.Op(self.pollyDiscussionTree.insert, pdt, safe=True)
-            except Exception, e:
-                callback(None, PollyException("Insert failed on PollyDiscussionTree(%s)" % (pdt,), e))
-                return
-        else:
-            try:
-                result = yield motor.Op(self.pollyDiscussionTree.find_and_modify, 
-                                        query={"subtree_id": subtree_id},
-                                        update={"$push": {"comments": comment}}, upsert=False)
-            except Exception, e:
-                callback(None, PollyException("find_and_modify failed on PollyDiscussionTree(%s)/$push(%s)" % (subtree_id, comment), e))
-                return
+        # Try for atomic upsert(1st comment) or update(Nth comment)
+        # If we were updating to add Nth comment, then the parent_uuid had to match.
+        comment = {"child_id": uuid.uuid4(), "pseudo":pseudo, "text":text, "repute":reputation, "time":datetime.utcnow() }
+        try:
+            subtree = yield motor.Op(self.pollyDiscussionTree.find_and_modify, 
+                                     query={"_id": parent_uuid, "subtree_id": parent_subtree_id},
+                                     update={"$push": {"comments": comment}}, 
+                                     upsert=True, new=True)
+        except Exception, e:
+            callback(None, PollyException("Possible hack attempt: find_and_modify failed on PollyDiscussionTree(%s, %s)/$push(%s)" % (str(parent_uuid), parent_subtree_id, str(comment)), e))
+            return
 
-        # Success!         
-        callback(comment, None)
+        # If we just upserted the 1st ever comment on this subtree, then validate that it was not bogus.
+        if len(subtree["comments"]) == 1:
+            error = None
+            try:
+                last_dot = parent_subtree_id.rindex(".")
+                parent_tree_id = parent_subtree_id[0:last_dot]
+                parent_comment_idx = int(parent_subtree_id[last_dot+1:])
+            except ValueError: # No '.' - Could be stupid parent_subtree_id or root of tree
+                error = PollyException("Possible hack attempt: Badly formed parent_subtree_id on PollyDiscussionTree(%s), _id(%s) comment insert(%s)" % (parent_subtree_id, str(parent_uuid), text), None)
+            else:
+                try:
+                    parent_subtree = yield motor.Op(self.pollyDiscussionTree.find_one, {"subtree_id": parent_tree_id})
+                except Exception, e:
+                    error = PollyException("find_one on PollyDiscussionTree._id(%s,%s) failed" % (str(parent_uuid), parent_tree_id), e)
+                else:
+                    if parent_subtree is None:
+                        error = PollyException("Possible hack attempt: Nonexistent parent_subtree(%s) on PollyDiscussionTree comment insert(%s)" % (parent_subtree_id, text), None)
+                    elif parent_subtree["comments"][parent_comment_idx]["child_id"] != parent_uuid:
+                        error = PollyException("Possible hack attempt: Unmatched parent_uuid(%s) on PollyDiscussionTree(%s) comment insert(%s)" % (str(parent_uuid), parent_subtree_id, text), None)
+
+            if error is not None:
+                # If there is any problem with the ancestry of the first comment added, then we have to remove it. 
+                # This is a bit unpleasant, adding it first and then removing when there's an error, but we're coding for the majority case rather than the exception..
+                yield motor.Op(self.pollyDiscussionTree.remove, {"_id": subtree["_id"]})
+                callback(None, error)
+                return
+        callback( (parent_subtree_id+"."+str(len(subtree["comments"])-1), comment), None)   # Success
 
 if __name__ == "__main__":
     class TestPollyDiscussionTree:
@@ -239,7 +277,6 @@ if __name__ == "__main__":
             # Initially clear PollyDiscussionTree and pollyReputation
             self.db = db
             self.pdt = PollyDiscussionTree(db)
-    
             
         @tornado.gen.engine
         def destroyPollyDiscussionTree(self, callback):
@@ -252,39 +289,38 @@ if __name__ == "__main__":
                 callback(None, PollyException("Failed destroying PollyDiscussionTree.", e))
                 return
             callback(True, None)
-            
     
         @tornado.gen.engine
         def createPollyDiscussionTree(self, callback):
-            comments = [
-                ("0"   , "0.0 - Root Comment"),
-                ("0.0"  , "0.0.0 - Comment0."),
-                ("0.0"  , "0.0.1 - Comment1."),
-                ("0.0"  , "0.0.2 - Comment2."),
-                ("0.0.0", "0.0.0.0 - Comment0."),
-                ("0.0.0", "0.0.0.1 - Comment1."),
-                ("0.0.0", "0.0.0.2 - Comment2."),
-                ("0.0.1", "0.0.1.0 - Comment0."),
-                ("0.0.1", "0.0.1.1 - Comment1."),
-                ("0.0.1", "0.0.1.2 - Comment2."),
-                ("0"   , "0.1 - Root Comment"),
-                ("0.1"  , "0.1.0 - Comment0."),
-                ("0.1"  , "0.1.1 - Comment1."),
-                ("0.1"  , "0.1.2 - Comment2."),
-                ("0.1.0", "0.1.0.0 - Comment0."),
-                ("0.1.0", "0.1.0.1 - Comment1."),
-                ("0.1.0", "0.1.0.2 - Comment2."),
-                ("0.1.1", "0.1.1.0 - Comment0."),
-                ("0.1.1", "0.1.1.1 - Comment1."),
-                ("0.1.1", "0.1.1.2 - Comment2."),
-             ]
-            pseudo="AndrewD"
-            for (subtree_id, comment) in comments:
-                try:
-                    full_comment = yield motor.Op(self.pdt.addCommentTosubtree, subtree_id, pseudo=pseudo, text=comment)
-                except Exception, e:
-                    callback(None, PollyException("Failed adding test comments %s/%s/%s" % (subtree_id, pseudo, comment), e))
-                    return
+            comments = {}
+
+            # Add root comments to bootstrap tree.
+            root_comments = ["0.0   - Root Comment", "0.1   - Root Comment", "0.2   - Root Comment"]
+            try:
+                for root_comment in root_comments:
+                    (subtree_id, comment) = yield motor.Op(self.pdt.addRootComment,
+                                                           root_comment)
+                    comments[subtree_id] = comment
+            except Exception, e:
+                callback(None, PollyException("Failed adding test root comments(%s)" % (root_comment,), e))
+                return
+            
+            # Add deeper comments as would be added by users.
+            try:
+                pseudo = "AndrewD"
+                for depth in xrange(4):
+                    new_comments = {}
+                    for parent_subtree_id, comment in comments.iteritems():
+                        for n in xrange(3):
+                            parent_uuid = comments[parent_subtree_id]["child_id"]
+                            (subtree_id, comment) = yield motor.Op(self.pdt.addCommentToSubtree,
+                                                                   parent_uuid, parent_subtree_id, parent_subtree_id+" - Comment%d"%n, pseudo)
+                            new_comments[subtree_id] = comment
+                    comments = new_comments
+            except Exception, e:
+                callback(None, PollyException("Failed adding test user comments(%s)" % (parent_subtree_id,), e))
+                return
+
             callback(True, None)
     
         @tornado.gen.engine
@@ -332,9 +368,9 @@ if __name__ == "__main__":
             yield motor.Op(testPolly.pdt.setupIndexes)
             yield motor.Op(testPolly.setupReputations)           # Setup some reputations to apply to the discussion tree.
             yield motor.Op(testPolly.createPollyDiscussionTree)  # Create a discussion tree.
-            yield motor.Op(testPolly.dumpTree, "0", 0)            # Do a recursive dump of the discussion tree, with reputations.
+            yield motor.Op(testPolly.dumpTree, "0", 0)           # Do a recursive dump of the discussion tree, with reputations.
         except PollyException, e:
-            print(e.dumpStr())
+            e.pollyStackDump()
             sys.exit(1)
         print "Done."
         sys.exit(0)
