@@ -85,14 +85,34 @@ from PollyException import PollyException
 #                "repute"  :  <reputation>      # The reputation of <UserPseudonym> at the time of the comment
 #                                               # Incidentally, a more expensive option would be to allow sorting
 #                                               # the comments by current reputation. Probably cached in memory.
-#                "text"    :  <StringComment>   # The actual comment. 
-#                                               # Allowing some simple (TBD) markup. Probably 'Markdown'.
+#                "title"   :  <StringComment>   # The actual comment. Plain text only.
+#                "text"    :  <StringComment>   # The actual comment. Allowing some simple (TBD) markup. Probably 'Markdown'.
 #            },
 #            ...
 #        ],
 #    }
 #
 #
+def intToAlpha(n):
+    if n > 0:
+        result = ''
+        while n > 0:
+            n,r = divmod(n, 26)
+            result = chr(97+r) + result
+    elif n == 0:
+        result = 'a'
+    else:
+        raise Exception("intToAlpha() doesn't do negative numbers")
+    return result
+
+def alphaToInt(alpha):
+    x = ''.join([chr(i) for i in range(97, 107)])
+    n = 0
+    for char in alpha:
+        if char < 'a' or char > 'z':
+            raise Exception("alphaToInt() only expecta 'a' to 'z'")
+        n = n*26 + (ord(char)-97)
+    return n
 
 
 class PollyDiscussionTree:
@@ -105,8 +125,7 @@ class PollyDiscussionTree:
     def setupIndexes(self, callback):
         try:
             a,b = yield [motor.Op(self.pollyDiscussionTree.ensure_index, "subtree_id"),
-                         motor.Op(self.pollyReputation.ensure_index, [("pseudo"    , ASCENDING),
-                                                                      ("subtree_id", ASCENDING)]) ]
+                         motor.Op(self.pollyReputation.ensure_index    , "pseudo")]
         except Exception as e:
             callback(None, PollyException("Failed setting up indexes", e))
             return
@@ -128,8 +147,8 @@ class PollyDiscussionTree:
         '''        
         try:
             polly_reputation = yield motor.Op(self.pollyReputation.find_and_modify, 
-                                              {"pseudo" : pseudo, "subtree": subtree_id},
-                                              {"$inc"   : {"repute": inc}}, 
+                                              {"pseudo" : pseudo},
+                                              {"$inc"   : {subtree_id+".count": inc}}, 
                                               upsert=True, new=True)
         except Exception as e:
             callback(None, PollyException("Couldn't increment reputation for pseudo(%s), subtree(%s)" % (pseudo, subtree_id), e))
@@ -141,9 +160,19 @@ class PollyDiscussionTree:
         '''getReputation: Accumulate the reputation of user(pseudo) for subtree(subtree_id)
                           and all superior subtree's. 
                           If no existing reputation, then zero. 
-                          e.g. {"pseudo":"X", "subtree":"1.1"  , "repute":4} 
-                               {"pseudo":"X", "subtree":"1.1.2", "repute":4}
-                          getReputation("X", "1.1.2.4") should return 8.
+                                {
+                                    'pseudo': 'Andrewd',
+                                    'repute': {
+                                        'a': {
+                                            'count': 4,
+                                            'b': {
+                                                  'count': 2,
+                                            }
+                                        }
+                                    }
+                                }
+                          getReputation("Andrewd", "a") should return 6.
+                          getReputation("Andrewd", "a.b") should return 2.
                           
                 pseudo     - The Pseudonym of the user to get reputation for.
                 subtree_id - Identifier of the subtree where the repute is wanted for.
@@ -152,20 +181,26 @@ class PollyDiscussionTree:
                 returns: Success: The aggregate reputation value.
                          Failure: PollyException
         '''        
-        key       = None   # Group over everything
-        condition = {"pseudo": pseudo,
-                     "$where": "this.subtree == \""+subtree_id+"\".substring(0, this.subtree.length)"""}
-        initial   = {"repute": 0}
-        reduce    = Code("""function (doc, out) { out.repute += doc.repute;}""")
         try:   # to get the pseudo's current reputation and determine how it applies to a subtree.
-            out = yield motor.Op(self.pollyReputation.group, key, condition, initial, reduce)
+            reputationTree = yield motor.Op(self.pollyReputation.find_one, {"pseudo":pseudo},
+                                            fields={subtree_id:True, "_id":False} )
         except Exception as e:
             callback(None, PollyException("Couldn't find pollyReputation(%s)" % (pseudo, ), e))
             return
-        if out == []:
-            callback(0, None)                   # Zero matches gives empty list.
-        else:
-            callback(int(out[0]["repute"]), None)  # JS sums as float.
+        if reputationTree == None:
+            callback(0, None)      # No reputation
+            return
+
+        def addTreeCount(tree): # Add up all counts in tree of reputations retrieved.
+            reputation = 0
+            for name,value in tree.items():
+                if name == 'count':
+                    reputation += value
+                else:
+                    reputation += addTreeCount(value)
+            return reputation
+        reputation = addTreeCount(reputationTree)
+        callback(reputation, None)
             
 
     @tornado.gen.engine
@@ -201,13 +236,14 @@ class PollyDiscussionTree:
         comment = {"child_id": uuid.uuid4(), "pseudo":'root', "text":text, "repute":0, "time":datetime.utcnow() }
         try:
             subtree = yield motor.Op(self.pollyDiscussionTree.find_and_modify, 
-                                     query={"subtree_id": '0'},
+                                     query={"subtree_id": 'a'},
                                      update={"$push": {"comments": comment}},
                                      upsert=True, new=True)
         except Exception as e:
-            callback(None, PollyException("find_and_modify failed adding comment(%s) to root of PollyDiscussionTree" % (str(comment),), e))
+            callback(None, PollyException("find_and_modify failed adding comment(%s) to root of PollyDiscussionTree" 
+                                          % (str(comment),), e))
             return
-        callback(('0.'+str(len(subtree["comments"])-1), comment), None)  # Success
+        callback(('a.'+intToAlpha(len(subtree["comments"])-1), comment), None)  # Success
         
 
     @tornado.gen.engine
@@ -240,7 +276,8 @@ class PollyDiscussionTree:
                                      update={"$push": {"comments": comment}}, 
                                      upsert=True, new=True)
         except Exception as e:
-            callback(None, PollyException("Possible hack attempt: find_and_modify failed on PollyDiscussionTree(%s, %s)/$push(%s)" % (str(parent_uuid), parent_subtree_id, str(comment)), e))
+            callback(None, PollyException("Possible hack attempt: find_and_modify failed on PollyDiscussionTree(%s, %s)/$push(%s)" 
+                                          % (str(parent_uuid), parent_subtree_id, str(comment)), e))
             return
 
         # If we just upserted the 1st ever comment on this subtree, then validate that it was not bogus.
@@ -249,9 +286,10 @@ class PollyDiscussionTree:
             try:
                 last_dot = parent_subtree_id.rindex(".")
                 parent_tree_id = parent_subtree_id[0:last_dot]
-                parent_comment_idx = int(parent_subtree_id[last_dot+1:])
+                parent_comment_idx = alphaToInt(parent_subtree_id[last_dot+1:])
             except ValueError: # No '.' - Could be stupid parent_subtree_id or root of tree
-                error = PollyException("Possible hack attempt: Badly formed parent_subtree_id on PollyDiscussionTree(%s), _id(%s) comment insert(%s)" % (parent_subtree_id, str(parent_uuid), text), None)
+                error = PollyException("Possible hack attempt: Badly formed parent_subtree_id on PollyDiscussionTree(%s), _id(%s) comment insert(%s)" 
+                                       % (parent_subtree_id, str(parent_uuid), text), None)
             else:
                 try:
                     parent_subtree = yield motor.Op(self.pollyDiscussionTree.find_one, {"subtree_id": parent_tree_id})
@@ -259,17 +297,20 @@ class PollyDiscussionTree:
                     error = PollyException("find_one on PollyDiscussionTree._id(%s,%s) failed" % (str(parent_uuid), parent_tree_id), e)
                 else:
                     if parent_subtree is None:
-                        error = PollyException("Possible hack attempt: Nonexistent parent_subtree(%s) on PollyDiscussionTree comment insert(%s)" % (parent_subtree_id, text), None)
+                        error = PollyException("Possible hack attempt: Nonexistent parent_subtree(%s) on PollyDiscussionTree comment insert(%s)" 
+                                               % (parent_subtree_id, text), None)
                     elif parent_subtree["comments"][parent_comment_idx]["child_id"] != parent_uuid:
-                        error = PollyException("Possible hack attempt: Unmatched parent_uuid(%s) on PollyDiscussionTree(%s) comment insert(%s)" % (str(parent_uuid), parent_subtree_id, text), None)
+                        error = PollyException("Possible hack attempt: Unmatched parent_uuid(%s) on PollyDiscussionTree(%s) comment insert(%s)" 
+                                               % (str(parent_uuid), parent_subtree_id, text), None)
 
             if error is not None:
                 # If there is any problem with the ancestry of the first comment added, then we have to remove it. 
-                # This is a bit unpleasant, adding it first and then removing when there's an error, but we're coding for the majority case rather than the exception..
+                # This is a bit unpleasant, adding it first and then removing when there's an error, but we're coding 
+                # for the majority case rather than the exception..
                 yield motor.Op(self.pollyDiscussionTree.remove, {"_id": subtree["_id"]})
                 callback(None, error)
                 return
-        callback( (parent_subtree_id+"."+str(len(subtree["comments"])-1), comment), None)   # Success
+        callback( (parent_subtree_id+"."+intToAlpha(len(subtree["comments"])-1), comment), None)   # Success
 
 if __name__ == "__main__":
     class TestPollyDiscussionTree:
@@ -295,7 +336,9 @@ if __name__ == "__main__":
             comments = {}
 
             # Add root comments to bootstrap tree.
-            root_comments = ["0.0   - Root Comment", "0.1   - Root Comment", "0.2   - Root Comment"]
+            root_comments = ["a.a   - Root Comment", 
+                             "a.b   - Root Comment", 
+                             "a.c   - Root Comment"]
             try:
                 for root_comment in root_comments:
                     (subtree_id, comment) = yield motor.Op(self.pdt.addRootComment,
@@ -314,7 +357,7 @@ if __name__ == "__main__":
                         for n in range(3):
                             parent_uuid = comments[parent_subtree_id]["child_id"]
                             (subtree_id, comment) = yield motor.Op(self.pdt.addCommentToSubtree,
-                                                                   parent_uuid, parent_subtree_id, parent_subtree_id+" - Comment%d"%n, pseudo)
+                                                                   parent_uuid, parent_subtree_id, parent_subtree_id+" - Comment %s"%intToAlpha(n), pseudo)
                             new_comments[subtree_id] = comment
                     comments = new_comments
             except Exception as e:
@@ -326,10 +369,10 @@ if __name__ == "__main__":
         @tornado.gen.engine
         def setupReputations(self, callback):
             reputations = [
-               ("AndrewD", "0.0"    , 42),
-               ("AndrewD", "0.1"    , 42),
-               ("AndrewD", "0.1"    ,  1),
-               ("AndrewD", "0.1.1.1",  1),
+               ("AndrewD", "a.a"    , 42),
+               ("AndrewD", "a.b"    , 42),
+               ("AndrewD", "a.b"    ,  1),
+               ("AndrewD", "a.b.b.b",  1),
             ]
             for (pseudo, subtree_id, inc) in reputations:
                 try:
@@ -351,7 +394,7 @@ if __name__ == "__main__":
                 return
     
             for n, comment in enumerate(subtree["comments"]):
-                new_subtree_id = subtree_id + "." + str(n)
+                new_subtree_id = subtree_id + "." + intToAlpha(n)
                 print(" "*indent, new_subtree_id+": time="+str(comment['time']), "pseudo="+comment['pseudo'], "repute="+str(comment['repute']), "comment="+comment['text']) 
                 try:
                     yield motor.Op(self.dumpTree, new_subtree_id, indent+4)
@@ -368,7 +411,7 @@ if __name__ == "__main__":
             yield motor.Op(testPolly.pdt.setupIndexes)
             yield motor.Op(testPolly.setupReputations)           # Setup some reputations to apply to the discussion tree.
             yield motor.Op(testPolly.createPollyDiscussionTree)  # Create a discussion tree.
-            yield motor.Op(testPolly.dumpTree, "0", 0)           # Do a recursive dump of the discussion tree, with reputations.
+            yield motor.Op(testPolly.dumpTree, "a", 0)           # Do a recursive dump of the discussion tree, with reputations.
         except PollyException as e:
             e.pollyStackDump()
             sys.exit(1)

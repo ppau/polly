@@ -52,7 +52,7 @@ class PollyException(Exception):
                     print(e.dumpStr())
     '''
     def __init__(self, message, e=None):
-        if isinstance(e, PollyException):
+        if isinstance(e, PollyException) or e is None:
             frame = sys._getframe(1)
             self.exception_description =  "PollyException: " + message
             self.exception_location    = 'File "'+frame.f_code.co_filename + '", line ' + str(frame.f_lineno) + ', method ' + frame.f_code.co_name
@@ -64,8 +64,8 @@ class PollyException(Exception):
         self.e = e
     
     def pollyStackDump(self, file=sys.stderr):
-        print >> file, "\nPolly Stack Trace:\n"
-        print >> file, self.dumpStr(4)
+        print("\nPolly Stack Trace:\n", file=file)
+        print(self.dumpStr(4), file=file)
             
     def dumpStr(self, indent):
         msg = " "*indent + self.exception_description + "\n"\
