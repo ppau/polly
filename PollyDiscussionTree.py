@@ -21,33 +21,33 @@ from PollyException import PollyException
 #   6. Sorting applies an individual sub-columns.
 #
 #   Consider the "Sample Tree Structure" shown below.
-#   1. Elements (1,2,3) are the primary sub-column.
-#   2. Elements (1.1, 1.2, 1.3) are a sub-column.
-#   3. Elements (2.1, 2.2, 2.3) are a separate sub-column from (1.1, 1.2, 1.3) 
+#   1. Elements (a,b,c,d) are the primary sub-column.
+#   2. Elements (b.a, b.b, b.c) are a sub-column.
+#   3. Elements (c.a, c.b, c.c) are a separate sub-column from (b.a, b.b, b.c) 
 #        
 #   Sample Tree Structure
-#   0
-#        0.0
-#        0.1
-#   1    
-#        1.0
-#        1.1
-#        1.2 
-#   2
-#        2.0
-#        2.1
-#            2.2.0
-#        2.2
-#            2.3.0
-#            2.3.1
-#   3
-#        3.0
-#            3.1.0
-#            3.1.1
-#        3.1
-#            3.2.0
-#            3.2.1
-#            3.2.2
+#   a
+#        a.a
+#        a.b
+#   b    
+#        b.a
+#        b.b
+#        b.c 
+#   c
+#        c.a
+#        c.b
+#            c.b.a
+#        c.c
+#            c.c.a
+#            c.c.b
+#   d
+#        d.a
+#            d.a.a
+#            d.a.b
+#        d.b
+#            d.b.a
+#            d.b.b
+#            d.b.c
 #
 #    Approach:
 #    1. Store each entire sub-column in a single MongoDB Document.
@@ -65,10 +65,15 @@ from PollyException import PollyException
 #
 #    MongoDB PollyReputation document format: 
 #    {
-#        "pseudo"    : <StringPseudonymName>,   # } Combined unique key of
-#        "subtree_id": <StringPseudonymName>,   # } both pseudo and subtree.
-#
-#        "repute"    : <reputationPoints>       # Reputation points applicable to just this subtree.
+#        'pseudo': 'Andrewd',
+#        'repute': {
+#            'a': {                        
+#                'count': 4,              # 'a' reputation is 4
+#                'b': {
+#                      'count': 2,        # 'a.b' reputation is 2
+#                }
+#            }
+#        }
 #    }
 #
 #    MongoDB PollyDiscussionTree document format: 
@@ -76,8 +81,8 @@ from PollyException import PollyException
 #        "_id"       : <uuid4>                  # Randomly generated uuid. When users add comments, the client request
 #                                               # must specify this uuid of the comment they are replying to. This protects
 #                                               # the tree against all sorts of hacks/bugs.  
-#        "subtree_id": <DottedDecimalSubreeId>, # Dotted tree hierarchy sub-tree reference as string. e.g. "3.3.1"
-#        "comments"  : [                        # Array position indicates next sub-tree level. e.g. 0th entry is 3.3.1.0
+#        "subtree_id": <DottedAlphaSubreeId>,   # Dotted tree hierarchy sub-tree reference as string. e.g.             "a.b.f"
+#        "comments"  : [                        # Array position indicates next sub-tree level.       e.g. 0th entry is a.b.f.a
 #            {
 #                "child_id":  <uuid4>           # child_id is _id of child PollyDiscussionTree document.
 #                "time"    :  <Comment Time>    # Time the comment was written in UTC
