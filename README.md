@@ -8,7 +8,4 @@ Representative democracy suffers from obvious problems where power gathers aroun
 
 The difference today is ubiquitous computing and networking, meaning that we can attempt to address the scale limitations that previously prevented large scale participative democracy.
 
-## Issue Tracking
-
-We are using a public [JIRA instance](http://jira.polly-project.org) for handling issue tracking.
 
